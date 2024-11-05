@@ -40,6 +40,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	// +kubebuilder:scaffold:imports
@@ -226,6 +227,7 @@ func main() {
 		WebhookServer:    webhookServer,
 		LeaderElection:   enableLeaderElection,
 		LeaderElectionID: leaderElectionId,
+		Controller:       config.Controller{MaxConcurrentReconciles: 10},
 		Client: client.Options{
 			Cache: &client.CacheOptions{
 				DisableFor: []client.Object{
