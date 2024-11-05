@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/actions-runner-controller/controllers/actions.github.com/metrics"
@@ -120,9 +122,7 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 			log.Error(err, "Failed to update ephemeral runner set with finalizer added")
 			return ctrl.Result{}, err
 		}
-
 		log.Info("Successfully added finalizer")
-		return ctrl.Result{}, nil
 	}
 
 	// Create proxy secret if not present
@@ -157,6 +157,11 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	ephemeralRunnerState := newEphemeralRunnerState(ephemeralRunnerList)
+	defer func() {
+		if err := r.cleanupFinishedEphemeralRunners(ctx, ephemeralRunnerState.finished, log); err != nil {
+			log.Error(err, "failed to cleanup finished ephemeral runners")
+		}
+	}()
 
 	log.Info("Ephemeral runner counts",
 		"pending", len(ephemeralRunnerState.pending),
@@ -191,11 +196,6 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	total := ephemeralRunnerState.scaleTotal()
 	if ephemeralRunnerSet.Spec.PatchID == 0 || ephemeralRunnerSet.Spec.PatchID != ephemeralRunnerState.latestPatchID {
-		defer func() {
-			if err := r.cleanupFinishedEphemeralRunners(ctx, ephemeralRunnerState.finished, log); err != nil {
-				log.Error(err, "failed to cleanup finished ephemeral runners")
-			}
-		}()
 		log.Info("Scaling comparison", "current", total, "desired", ephemeralRunnerSet.Spec.Replicas)
 		switch {
 		case total < ephemeralRunnerSet.Spec.Replicas: // Handle scale up
@@ -205,7 +205,6 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 				log.Error(err, "failed to make ephemeral runner")
 				return ctrl.Result{}, err
 			}
-
 		case ephemeralRunnerSet.Spec.PatchID > 0 && total >= ephemeralRunnerSet.Spec.Replicas: // Handle scale down scenario.
 			// If ephemeral runner did not yet update the phase to succeeded, but the scale down
 			// request is issued, we should ignore the scale down request.
@@ -246,7 +245,7 @@ func (r *EphemeralRunnerSetReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 }
 
 func (r *EphemeralRunnerSetReconciler) cleanupFinishedEphemeralRunners(ctx context.Context, finishedEphemeralRunners []*v1alpha1.EphemeralRunner, log logr.Logger) error {
@@ -359,27 +358,48 @@ func (r *EphemeralRunnerSetReconciler) cleanUpEphemeralRunners(ctx context.Conte
 func (r *EphemeralRunnerSetReconciler) createEphemeralRunners(ctx context.Context, runnerSet *v1alpha1.EphemeralRunnerSet, count int, log logr.Logger) error {
 	// Track multiple errors at once and return the bundle.
 	errs := make([]error, 0)
+	var wg sync.WaitGroup
+	batchSize := min(count, 5)
+
+	runnerCh := make(chan *v1alpha1.EphemeralRunner, count)
+	errCh := make(chan error, count)
+
+	for i := 0; i < batchSize; i++ {
+		wg.Add(1)
+		go func(ctx context.Context, runnerSet *v1alpha1.EphemeralRunnerSet, log logr.Logger, input chan *v1alpha1.EphemeralRunner, errCh chan error) {
+			defer wg.Done()
+			for ephemeralRunner := range input {
+				// Make sure that we own the resource we create.
+				if err := ctrl.SetControllerReference(runnerSet, ephemeralRunner, r.Scheme); err != nil {
+					log.Error(err, "failed to set controller reference on ephemeral runner")
+					errCh <- err
+					continue
+				}
+
+				log.Info("Creating new ephemeral runner", "total", count)
+				if err := r.Create(ctx, ephemeralRunner); err != nil {
+					log.Error(err, "failed to make ephemeral runner")
+					errCh <- err
+					continue
+				}
+			}
+		}(ctx, runnerSet, log, runnerCh, errCh)
+	}
+
 	for i := 0; i < count; i++ {
 		ephemeralRunner := r.ResourceBuilder.newEphemeralRunner(runnerSet)
 		if runnerSet.Spec.EphemeralRunnerSpec.Proxy != nil {
 			ephemeralRunner.Spec.ProxySecretRef = proxyEphemeralRunnerSetSecretName(runnerSet)
 		}
+		runnerCh <- ephemeralRunner
+	}
 
-		// Make sure that we own the resource we create.
-		if err := ctrl.SetControllerReference(runnerSet, ephemeralRunner, r.Scheme); err != nil {
-			log.Error(err, "failed to set controller reference on ephemeral runner")
-			errs = append(errs, err)
-			continue
-		}
+	close(runnerCh)
+	close(errCh)
+	wg.Wait()
 
-		log.Info("Creating new ephemeral runner", "progress", i+1, "total", count)
-		if err := r.Create(ctx, ephemeralRunner); err != nil {
-			log.Error(err, "failed to make ephemeral runner")
-			errs = append(errs, err)
-			continue
-		}
-
-		log.Info("Created new ephemeral runner", "runner", ephemeralRunner.Name)
+	for err := range errCh {
+		errs = append(errs, err)
 	}
 
 	return multierr.Combine(errs...)
